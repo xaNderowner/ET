@@ -1,5 +1,6 @@
 import streamlit as st
 import xml.etree.ElementTree as ET
+import re
 
 # --- SABİT MPWO ŞABLONU ---
 MPWO_SABLON = """<WorkOrderResponse>
@@ -39,77 +40,116 @@ MPWO_SABLON = """<WorkOrderResponse>
 	</Body>
 </WorkOrderResponse>"""
 
+def get_cvalue(root, key_name, ns):
+    """Log içindeki ns13:cValue etiketlerini bulur."""
+    node = root.find(f".//ns13:cValue[@key='{key_name}']", ns)
+    return node.text if node is not None and node.text is not None else ""
+
 # --- Arayüz Ayarları ---
 st.set_page_config(page_title="XML ID & Attribute Sync Tool", layout="wide")
 st.title("XML ID & Attribute Sync Tool")
 
-# Seçim Menüsü
 secim = st.selectbox("Mesaj Türü Seçin", ["MPWO", "Asup_Termination", "DSL_Termination"])
 
-# Kutular
 col1, col2 = st.columns(2)
 with col1:
-    data1 = st.text_area("Kaynak XML 1 (Request Mesajı)", height=300)
+    raw1 = st.text_area("Kaynak XML 1 (Request Mesajı)", height=300)
 with col2:
-    txt_src2 = st.text_area("Kaynak XML 2 (Opsiyonel)", height=300)
+    raw2 = st.text_area("Kaynak XML 2 (Log/Exception Mesajı)", height=300)
 
 st.write("---")
 
 # İşlem Butonu
 if st.button("Verileri Senkronize Et ve Oluştur", type="primary", use_container_width=True):
-    data1 = data1.strip()
+    raw1 = raw1.strip()
+    raw2 = raw2.strip()
 
-    if not data1:
-        st.warning("Lütfen Kaynak 1 kutusuna Request XML'ini yapıştırın.")
+    if not raw1 or not raw2:
+        st.warning("Lütfen her iki kutuya da veri yapıştırın.")
     else:
         try:
-            # Namespace tanımları
-            ns = {
+            # Namespaceler
+            ns1 = {
                 'esbCommonType': 'http://www.turktelekom.com.tr/aTTIP/Common/CommonType/1.0',
                 'workOrderRequest': 'http://www.turktelekom.com.tr/aTTIP/Services/OrderFulfillment/ManagePartnerWorkOrder/WorkOrderRequest/1.0'
             }
+            ns2 = {'ns13': 'http://www.innova.com.tr/WFM'}
 
-            root_request = ET.fromstring(data1)
+            root_req = ET.fromstring(raw1)
+            root_sablon = ET.fromstring(MPWO_SABLON)
 
-            if secim == "MPWO":
-                root_sablon = ET.fromstring(MPWO_SABLON)
+            # Kaynak 2 (Log) içinden XML'i Regex ile ayıkla
+            xml_match = re.search(r'<ns13:genericIYSMessageRequest.*</ns13:genericIYSMessageRequest>', raw2, re.DOTALL)
+            if not xml_match:
+                st.error("Kaynak 2'de geçerli bir XML log bloğu bulunamadı!")
+            else:
+                root_log = ET.fromstring(xml_match.group(0))
 
-                # 1. TEXT TAGLERİNİ GÜNCELLE (Header kısmındakiler)
-                id_list = ["correlationID", "businessID", "conversationID", "requestID", "messageID"]
-                for id_name in id_list:
-                    val_node = root_request.find(f".//esbCommonType:{id_name}", ns)
-                    if val_node is not None:
-                        target_node = root_sablon.find(f".//{id_name}")
-                        if target_node is not None:
-                            target_node.text = val_node.text
+                if secim == "MPWO":
+                    order_info_sablon = root_sablon.find(".//orderInfo")
+                    cpe_info_sablon = root_sablon.find(".//cpeInfo")
 
-                # 2. ATTRIBUTE (ÖZNİTELİK) GÜNCELLEME (orderInfo ve cpeInfo)
-                
-                # --- orderInfo Güncelleme ---
-                req_order_info = root_request.find(".//workOrderRequest:orderInfo", ns)
-                sablon_order_info = root_sablon.find(".//orderInfo")
-                
-                if req_order_info is not None and sablon_order_info is not None:
-                    # workOrderId ve serviceOrderId kopyala
-                    if "workOrderId" in req_order_info.attrib:
-                        sablon_order_info.set("workOrderId", req_order_info.attrib["workOrderId"])
-                    if "serviceOrderId" in req_order_info.attrib:
-                        sablon_order_info.set("serviceOrderId", req_order_info.attrib["serviceOrderId"])
+                    # --- 1. KAYNAK 1 (REQUEST) İŞLEMLERİ ---
+                    # Header Text Tagleri (Wildcard ile kesin bulma)
+                    id_list = ["correlationID", "businessID", "conversationID", "requestID", "messageID"]
+                    for id_name in id_list:
+                        val_node = root_req.find(f".//{{*}}{id_name}")
+                        if val_node is not None:
+                            target_node = root_sablon.find(f".//{id_name}")
+                            if target_node is not None:
+                                target_node.text = val_node.text
+                    
+                    # Timestamp Update
+                    ts_node = root_req.find(".//{*}timestamp")
+                    if ts_node is not None:
+                        root_sablon.find(".//timestamp").text = ts_node.text
 
-                # --- cpeInfo Güncelleme ---
-                req_cpe_info = root_request.find(".//workOrderRequest:cpeInfo", ns)
-                sablon_cpe_info = root_sablon.find(".//cpeInfo")
+                    # orderInfo Attributes (ID'ler)
+                    req_order_info = root_req.find(".//{*}orderInfo")
+                    if req_order_info is not None and order_info_sablon is not None:
+                        order_info_sablon.set("workOrderId", req_order_info.attrib.get("workOrderId", "BEKLIYOR"))
+                        order_info_sablon.set("serviceOrderId", req_order_info.attrib.get("serviceOrderId", "BEKLIYOR"))
 
-                if req_cpe_info is not None and sablon_cpe_info is not None:
-                    if "cpeSubscriptionID" in req_cpe_info.attrib:
-                        sablon_cpe_info.set("cpeSubscriptionID", req_cpe_info.attrib["cpeSubscriptionID"])
+                    # cpeSubscriptionID
+                    found_sub_id = None
+                    cpe_req_attr = root_req.find(".//{*}cpeInfo")
+                    if cpe_req_attr is not None and "cpeSubscriptionID" in cpe_req_attr.attrib:
+                        found_sub_id = cpe_req_attr.attrib["cpeSubscriptionID"]
+                    if not found_sub_id:
+                        found_sub_id = root_req.findtext(".//{*}subscriptionId")
+                    if not found_sub_id:
+                        found_sub_id = root_req.findtext(".//{*}id")
+                    
+                    if found_sub_id and cpe_info_sablon is not None:
+                        cpe_info_sablon.set("cpeSubscriptionID", found_sub_id)
 
-                # Sonuç
-                final_xml = ET.tostring(root_sablon, encoding='unicode')
-                
-                st.success("Sonuç XML Başarıyla Oluşturuldu!")
-                # Streamlit'te st.code bloğu sağ üstte otomatik kopyalama butonu ile gelir
-                st.code(final_xml, language="xml")
+                    # --- 2. KAYNAK 2 (LOG) İŞLEMLERİ ---
+                    # actualCompletionDate
+                    actual_date = root_log.findtext(".//ns13:actualEndDate", "", ns2)
+                    if actual_date and order_info_sablon is not None:
+                        order_info_sablon.set("actualCompletionDate", actual_date.replace(" ", "T"))
+
+                    # cpeInfo Attributes (Cihaz Özellikleri cValue'dan)
+                    log_resource = root_log.find(".//ns13:resource", ns2)
+                    if log_resource is not None and cpe_info_sablon is not None:
+                        cpe_mapping = {
+                            "cpeEquipmentTypeCode": "TIP_KODU",
+                            "cpeEquipmentTypeName": "TIP_ADI",
+                            "cpeEquipmentModelCode": "MODEL_KODU",
+                            "cpeEquipmentModelName": "MODEL_ADI",
+                            "cpeVendorCode": "MARKA_KODU",
+                            "cpeVendorName": "MARKA_ADI",
+                            "cpeSerialNumber": "SERI_NO"
+                        }
+                        for sab_attr, log_key in cpe_mapping.items():
+                            val = get_cvalue(log_resource, log_key, ns2)
+                            if val:
+                                cpe_info_sablon.set(sab_attr, val)
+
+                    # Sonuç oluştur ve ekrana bas
+                    final_xml = ET.tostring(root_sablon, encoding='unicode')
+                    st.success("Sonuç XML Başarıyla Oluşturuldu! (Sağ üstteki butondan kopyalayabilirsiniz)")
+                    st.code(final_xml, language="xml")
 
         except Exception as e:
             st.error(f"İşlem sırasında hata:\n{e}")
